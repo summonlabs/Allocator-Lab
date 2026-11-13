@@ -40,23 +40,27 @@ public:
         if (req.size > bounds_.max_allocation_size) { r.error = make_error(ErrorCode::size_too_large, "too large"); return r; }
         std::size_t align = req.alignment ? req.alignment : 16;
         if (!is_power_of_two(align) || align > 256) { r.error = make_error(ErrorCode::alignment_unsupported, "size-class supports up to 256-byte alignment"); return r; }
-        auto idx = class_index_for(req.size);
+        // A slot is aligned to its class stride (up to 256), so the class must be at
+        // least as large as the alignment that was asked for.
+        auto idx = class_index_for(req.size > align ? req.size : align);
         if (!idx) { r.error = make_error(ErrorCode::size_too_large, "no size class covers request"); ++failures_; return r; }
         Class& cls = classes_[*idx];
-        bool grow = cls.free_list.empty();
-        if (grow) {
+        // A slot that was freed is reused first; one never handed out is fresh backing.
+        if (cls.free_list.empty() && cls.fresh_list.empty()) {
             if (total_bytes_ + cls.slot_stride * cls.block_slots > max_bytes_) { r.error = make_error(ErrorCode::capacity_exceeded, "size-class capacity reached"); ++failures_; return r; }
             grow_class(cls);
+            if (cls.fresh_list.empty()) { r.error = make_error(ErrorCode::out_of_memory, "class growth failed"); ++failures_; return r; }
             ++growth_events_;
         }
-        if (cls.free_list.empty()) { r.error = make_error(ErrorCode::out_of_memory, "class growth failed"); ++failures_; return r; }
-        void* slot = cls.free_list.back(); cls.free_list.pop_back();
-        bool reused = !grow;
+        const bool reused = !cls.free_list.empty();
+        void* slot = nullptr;
+        if (reused) { slot = cls.free_list.back(); cls.free_list.pop_back(); }
+        else { slot = cls.fresh_list.back(); cls.fresh_list.pop_back(); }
         if (any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(slot, cls.size);
         if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(slot, cls.size, detail::kPoisonAllocByte);
         AllocationId id = ++next_id_;
         live_.emplace(id, Entry{ slot, *idx });
-        r.error = Error{}; r.id = id; r.address = slot; r.size = cls.size; r.alignment = 16; r.reused_backing = reused;
+        r.error = Error{}; r.id = id; r.address = slot; r.size = cls.size; r.alignment = slot_alignment(cls); r.reused_backing = reused;
         ++success_; ++live_count_; if (live_count_ > peak_live_) peak_live_ = live_count_;
         live_bytes_ += cls.size; if (live_bytes_ > peak_bytes_) peak_bytes_ = live_bytes_;
         requested_bytes_ += req.size; granted_bytes_ += cls.size;
@@ -74,8 +78,8 @@ public:
         if (poison_on_free_) detail::fill_poison(e.ptr, cls.size, detail::kPoisonFreeByte);
         cls.free_list.push_back(e.ptr);
         live_.erase(it);
-        if (live_count_) --live_count_; if (live_bytes_ >= cls.size) live_bytes_ -= cls.size;
-        ++same_size_reuse_;
+        if (live_count_) --live_count_;
+        if (live_bytes_ >= cls.size) live_bytes_ -= cls.size;
         return Error{};
     }
 
@@ -89,7 +93,7 @@ public:
         std::lock_guard lock(mutex_);
         for (auto& cls : classes_) {
             for (auto* b : cls.blocks) detail::aligned_free(b);
-            cls.blocks.clear(); cls.free_list.clear(); cls.total_slots = 0;
+            cls.blocks.clear(); cls.free_list.clear(); cls.fresh_list.clear(); cls.total_slots = 0;
         }
         live_.clear(); live_count_ = 0; live_bytes_ = 0; total_bytes_ = 0;
         return Error{};
@@ -100,7 +104,7 @@ public:
         auto it = live_.find(handle);
         if (it == live_.end()) return make_error(ErrorCode::invalid_handle, "query of unknown handle");
         Class& cls = classes_[it->second.class_idx];
-        out.id = handle; out.size = cls.size; out.granted_size = cls.size; out.alignment = 16;
+        out.id = handle; out.size = cls.size; out.granted_size = cls.size; out.alignment = slot_alignment(cls);
         out.address = it->second.ptr; out.live = true;
         return Error{};
     }
@@ -129,7 +133,7 @@ public:
         std::lock_guard lock(mutex_);
         for (auto& cls : classes_) {
             for (auto* b : cls.blocks) detail::aligned_free(b);
-            cls.blocks.clear(); cls.free_list.clear();
+            cls.blocks.clear(); cls.free_list.clear(); cls.fresh_list.clear();
         }
         live_.clear(); live_count_ = 0; live_bytes_ = 0; total_bytes_ = 0;
     }
@@ -143,7 +147,8 @@ private:
         std::size_t size = 0;
         std::size_t slot_stride = 0;
         std::size_t block_slots = 8;
-        std::vector<void*> free_list;
+        std::vector<void*> free_list;    // slots that were handed out and freed
+        std::vector<void*> fresh_list;   // slots that were never handed out
         std::vector<void*> blocks;
         std::size_t total_slots = 0;
         std::uint64_t alloc_count = 0;
@@ -175,14 +180,17 @@ private:
         --v; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; v |= v >> 32; return v + 1;
     }
 
+    // The alignment every slot of a class has: its (power-of-two) stride, up to 256.
+    static std::size_t slot_alignment(const Class& cls) { return cls.slot_stride < 256 ? cls.slot_stride : 256; }
+
     void grow_class(Class& cls) {
         std::size_t n = cls.block_slots;
         std::size_t bytes = cls.slot_stride * n;
-        void* base = detail::aligned_alloc(bytes, 16);
+        void* base = detail::aligned_alloc(bytes, slot_alignment(cls));
         if (!base) return;
         cls.blocks.push_back(base);
         char* p = static_cast<char*>(base);
-        for (std::size_t i = 0; i < n; ++i) cls.free_list.push_back(p + i * cls.slot_stride);
+        for (std::size_t i = 0; i < n; ++i) cls.fresh_list.push_back(p + i * cls.slot_stride);
         cls.total_slots += n;
         total_bytes_ += bytes;
         if (total_bytes_ > peak_total_) peak_total_ = total_bytes_;

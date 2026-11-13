@@ -24,7 +24,8 @@ public:
     SegregatedAllocator(std::size_t superblock_size = 128u * 1024, std::size_t max_bytes = size_t(-1),
                         std::string name = "segregated_fit", std::uint64_t field_id = 0)
         : AllocatorBase(field_id, std::move(name), AllocatorKind::SegregatedFit),
-          superblock_size_(superblock_size), max_bytes_(max_bytes) {
+          // Zero means "the default": a superblock always has room for a block.
+          superblock_size_(superblock_size ? superblock_size : 128u * 1024), max_bytes_(max_bytes) {
         max_bin_ = ceil_log2(superblock_size_);
         bins_.resize(max_bin_ + 1);
         AllocatorCapabilities c;
@@ -72,7 +73,7 @@ public:
         Block* b = it->second;
         if (b->magic != kMagicBusy) return make_error(ErrorCode::double_free, "corrupt/double free");
         if (poison_on_free_) detail::fill_poison(static_cast<char*>(static_cast<void*>(b)) + header_size, b->size - header_size, detail::kPoisonFreeByte);
-        b->magic = kMagicFree; b->busy = false;
+        b->magic = kMagicFree;
         insert_bin(b);
         live_.erase(it);
         ++freed_count_; ++same_size_reuse_;
@@ -133,7 +134,9 @@ private:
     static constexpr std::size_t min_block = header_size + 8;
     static constexpr std::uint64_t kMagicFree = 0x5E6AFAF0ULL;
     static constexpr std::uint64_t kMagicBusy = 0x5E6AFAF1ULL;
-    struct Block { std::uint64_t magic; std::size_t size; bool busy; };
+    struct Block { std::uint64_t magic; std::size_t size; };
+    // The payload starts right after the header: nothing of Block may reach into it.
+    static_assert(sizeof(Block) <= 16, "Block must fit in header_size");
 
     static std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) & ~(a - 1); }
     static std::uint64_t ceil_log2(std::size_t v) { std::uint64_t r = 0; std::size_t s = 1; while (s < v) { s <<= 1; ++r; } return r; }
@@ -147,7 +150,9 @@ private:
     }
 
     Block* find_block(std::size_t need) {
+        // Blocks larger than the nominal superblock all live in the last bin.
         std::uint64_t start = ceil_log2(need);
+        if (start > max_bin_) start = max_bin_;
         ++search_depth_;
         for (std::uint64_t bin = start; bin <= max_bin_; ++bin) {
             auto& fl = bins_[bin];
@@ -158,12 +163,12 @@ private:
                     fl.erase(it);
                     if (b->size - need >= min_block) {
                         Block* rest = reinterpret_cast<Block*>(reinterpret_cast<char*>(b) + need);
-                        rest->magic = kMagicFree; rest->size = b->size - need; rest->busy = false;
+                        rest->magic = kMagicFree; rest->size = b->size - need;
                         insert_bin(rest);
                         b->size = need;
                         ++split_count_;
                     }
-                    b->magic = kMagicBusy; b->busy = true;
+                    b->magic = kMagicBusy;
                     return b;
                 }
             }
@@ -178,7 +183,7 @@ private:
         if (!mem) return false;
         superblocks_.push_back(mem);
         Block* b = reinterpret_cast<Block*>(mem);
-        b->magic = kMagicFree; b->size = sz; b->busy = false;
+        b->magic = kMagicFree; b->size = sz;
         insert_bin(b);
         total_bytes_ += sz;
         if (total_bytes_ > peak_total_) peak_total_ = total_bytes_;

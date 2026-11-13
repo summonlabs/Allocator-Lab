@@ -50,47 +50,76 @@ struct StreamState {
     bool invariant_failed = false;
 };
 
-void apply_entry(AllocatorStrategy& a, const TraceEntry& e, StreamState& st, std::uint64_t& total_ns) {
+// How one entry is applied.
+//   touch:  write a deterministic pattern into each allocation and check it before
+//           the block is freed or reallocated (config.verify_payload). Only done for
+//           memory the host can address.
+//   record: count the operation in the latency and elapsed-time figures (false
+//           while warming up).
+// Latency covers the allocator call alone, never the pattern work around it.
+struct ApplyMode { bool touch = false; bool record = true; };
+
+void apply_entry(AllocatorStrategy& a, const TraceEntry& e, StreamState& st, std::uint64_t& total_ns,
+                 const ApplyMode& mode) {
     ++st.ops;
-    const std::uint64_t op_start = now_ns();
     AllocationResult res;
+    std::uint64_t spent = 0;
     if (e.op == TraceOperationType::Allocate) {
         AllocationRequest req{}; req.size = static_cast<std::size_t>(e.size); req.alignment = static_cast<std::size_t>(e.alignment); req.domain = e.domain; req.tag = e.tag;
+        const std::uint64_t t0 = now_ns();
         res = a.allocate(req);
+        spent = now_ns() - t0;
         if (res.error.ok()) {
             st.live[e.id] = Pending{ res.id, e.id, res.address, res.size };
             ++st.successes;
-            write_pattern(res.address, res.size, e.id);
+            if (mode.touch) write_pattern(res.address, res.size, e.id);
         } else { ++st.failures; }
-        st.alloc_lat.add(now_ns() - op_start);
+        if (mode.record) st.alloc_lat.add(spent);
     } else if (e.op == TraceOperationType::Free) {
         auto it = st.live.find(e.id);
         if (it != st.live.end()) {
-            if (e.size != 0 && !verify_pattern(it->second.addr, it->second.size, e.id)) st.invariant_failed = true;
+            if (mode.touch && !verify_pattern(it->second.addr, it->second.size, e.id)) {
+                // The payload changed while the allocation was live: a failure of the run.
+                st.invariant_failed = true; ++st.failures;
+            }
+            const std::uint64_t t0 = now_ns();
             Error err = a.free(it->second.alloc_id);
+            spent = now_ns() - t0;
             if (err.ok()) ++st.successes; else ++st.failures;
-            st.free_lat.add(now_ns() - op_start);
+            if (mode.record) st.free_lat.add(spent);
             st.live.erase(it);
-        } else { ++st.failures; st.free_lat.add(now_ns() - op_start); }
+        } else { ++st.failures; if (mode.record) st.free_lat.add(0); }
     } else if (e.op == TraceOperationType::Reallocate) {
         auto it = st.live.find(e.id);
         if (it != st.live.end()) {
-            if (!verify_pattern(it->second.addr, it->second.size, e.id)) st.invariant_failed = true;
+            if (mode.touch && !verify_pattern(it->second.addr, it->second.size, e.id)) {
+                st.invariant_failed = true; ++st.failures;
+            }
             AllocationRequest req{}; req.size = static_cast<std::size_t>(e.size); req.alignment = static_cast<std::size_t>(e.alignment); req.domain = e.domain; req.tag = e.tag;
+            const std::uint64_t t0 = now_ns();
             res = a.reallocate(it->second.alloc_id, req);
+            spent = now_ns() - t0;
             if (res.error.ok()) {
                 it->second.addr = res.address; it->second.size = res.size;
                 ++st.successes;
-                write_pattern(res.address, res.size, e.id);
+                if (mode.touch) write_pattern(res.address, res.size, e.id);
             } else { ++st.failures; }
-            st.realloc_lat.add(now_ns() - op_start);
-        } else { ++st.failures; st.realloc_lat.add(now_ns() - op_start); }
+            if (mode.record) st.realloc_lat.add(spent);
+        } else { ++st.failures; if (mode.record) st.realloc_lat.add(0); }
     } else {
         // trim / reset / barrier / phase marker
+        const std::uint64_t t0 = now_ns();
         if (e.op == TraceOperationType::Trim) { Error err = a.trim(); if (!err.ok()) ++st.failures; }
         else if (e.op == TraceOperationType::Reset) { Error err = a.reset(); if (!err.ok()) ++st.failures; }
+        spent = now_ns() - t0;
     }
-    total_ns += now_ns() - op_start;
+    if (mode.record) total_ns += spent;
+}
+
+// Patterns are written from the host, so only into memory the host can address.
+bool host_addressable(const AllocatorStrategy& a) {
+    for (MemoryDomain d : a.capabilities().domains) if (d == MemoryDomain::Device) return false;
+    return true;
 }
 
 } // namespace
@@ -114,8 +143,11 @@ ExperimentResult run_replay(AllocatorStrategy& allocator, const Trace& trace,
     SnapshotId snap_id = 0;
     std::uint64_t elapsed = 0;
     std::uint64_t warm = std::min(config.warmup_ops, trace.entry_count());
+    ApplyMode mode;
+    mode.touch = config.verify_payload && host_addressable(allocator);
     for (std::uint64_t i = 0; i < trace.entry_count(); ++i) {
-        apply_entry(allocator, trace.entries[i], st, elapsed);
+        mode.record = i >= warm;   // warm-up operations run, but are not timed
+        apply_entry(allocator, trace.entries[i], st, elapsed, mode);
         if (config.snapshot_interval && i >= warm && (i % config.snapshot_interval == 0)) {
             ExperimentSnapshot snap{};
             snap.snapshot_id = ++snap_id; snap.experiment_id = result.experiment_id;
@@ -179,10 +211,12 @@ ExperimentResult run_concurrent(AllocatorStrategy& allocator, const Trace& trace
     std::vector<std::uint64_t> elapsed(threads, 0);
     std::vector<std::thread> workers;
     workers.reserve(threads);
+    ApplyMode mode;
+    mode.touch = config.verify_payload && host_addressable(allocator);
     for (std::uint32_t t = 0; t < threads; ++t) {
         workers.emplace_back([&, t] {
             std::uint64_t el = 0;
-            for (const TraceEntry* e : per_worker[t]) apply_entry(allocator, *e, states[t], el);
+            for (const TraceEntry* e : per_worker[t]) apply_entry(allocator, *e, states[t], el, mode);
             elapsed[t] = el;
         });
     }

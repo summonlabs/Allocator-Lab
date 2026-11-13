@@ -57,6 +57,11 @@ public:
         void* p = nullptr;
         cudaError_t e = cudaMallocAsync(&p, sz, stream_);
         if (e != cudaSuccess) { r.error = make_error(cuda_to_error(e), cuda_error_message(e)); return r; }
+        // A zero-fill request is honored on the device, in stream order.
+        if (p && req.size && any(req.flags & AllocationFlags::ZeroFill)) {
+            cudaError_t ze = cudaMemsetAsync(p, 0, req.size, stream_);
+            if (ze != cudaSuccess) { cudaFreeAsync(p, stream_); r.error = make_error(cuda_to_error(ze), cuda_error_message(ze)); ++failures_; return r; }
+        }
         AllocationId id = ++next_id_;
         records_.emplace(id, Record{ p, sz });
         r.error = Error{}; r.id = id; r.address = p; r.size = req.size; r.alignment = 256;

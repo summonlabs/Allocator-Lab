@@ -65,6 +65,12 @@ public:
             if (mapping_) {
                 region_ = static_cast<char*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0));
                 if (region_) { MappedHeader* h = reinterpret_cast<MappedHeader*>(region_); if (h->magic != kMappedMagic) { UnmapViewOfFile(region_); region_ = nullptr; } else init_ok_ = true; }
+                if (region_) {
+                    // An existing mapping has the size its creator gave it, whatever
+                    // size was passed here: allocation stays inside what is mapped.
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(region_, &mbi, sizeof(mbi)) != 0 && mbi.RegionSize != 0) total_bytes_ = mbi.RegionSize;
+                }
             }
         }
         setup_latency_ns_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -72,7 +78,8 @@ public:
         (void)total_bytes; (void)kHeader;
 #endif
         AllocatorCapabilities c;
-        c.supports_allocate = init_ok_; c.supports_free = init_ok_; c.supports_query = true;
+        // Arena-like: free() always answers not_supported, and says so here too.
+        c.supports_allocate = init_ok_; c.supports_free = false; c.supports_query = true;
         c.is_thread_safe = true; c.allows_per_object_free = false;
         c.max_alignment = 4096; c.max_allocation_size = total_bytes_ - kHeader;
         c.domains = { MemoryDomain::Mapped };
@@ -90,19 +97,24 @@ public:
         std::size_t align = req.alignment ? req.alignment : 16;
         if (!is_power_of_two(align) || align > 4096) { r.error = make_error(ErrorCode::alignment_unsupported, "mapped supports up to 4096-byte alignment"); return r; }
         std::size_t sz = req.size == 0 ? 1 : req.size;
-        std::size_t aligned = align_up(sz, align > 16 ? align : 16);
+        if (sz > total_bytes_) { r.error = make_error(ErrorCode::capacity_exceeded, "mapped region capacity reached"); ++failures_; return r; }
+        const std::uint64_t span = align_up(sz, 16);
         MappedHeader* h = reinterpret_cast<MappedHeader*>(region_);
         volatile LONGLONG* next = reinterpret_cast<volatile LONGLONG*>(&h->next);
         for (;;) {
             LONGLONG cur = InterlockedCompareExchange64(next, 0, 0);
-            if (cur + static_cast<LONGLONG>(aligned) > static_cast<LONGLONG>(total_bytes_)) { r.error = make_error(ErrorCode::capacity_exceeded, "mapped region capacity reached"); ++failures_; return r; }
-            LONGLONG reserve = cur + static_cast<LONGLONG>(aligned);
+            // The address is aligned, not only the size: the block starts at the
+            // next multiple of `align` (the view itself is page-aligned).
+            const std::uint64_t ucur = static_cast<std::uint64_t>(cur);
+            const std::uint64_t start = (ucur + (align - 1)) & ~static_cast<std::uint64_t>(align - 1);
+            if (cur < 0 || start < ucur || start > total_bytes_ || span > total_bytes_ - start) { r.error = make_error(ErrorCode::capacity_exceeded, "mapped region capacity reached"); ++failures_; return r; }
+            LONGLONG reserve = static_cast<LONGLONG>(start + span);
             if (InterlockedCompareExchange64(next, reserve, cur) == cur) {
-                void* p = static_cast<void*>(region_ + static_cast<std::uint64_t>(cur));
+                void* p = static_cast<void*>(region_ + start);
                 if (any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(p, sz);
                 if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(p, sz, detail::kPoisonAllocByte);
                 AllocationId id = ++next_id_;
-                live_.emplace(id, Live{ static_cast<std::uint64_t>(cur), sz, align });
+                live_.emplace(id, Live{ start, sz, align });
                 r.error = Error{}; r.id = id; r.address = p; r.size = req.size; r.alignment = align;
                 ++success_; ++live_count_; if (live_count_ > peak_live_) peak_live_ = live_count_;
                 live_bytes_ += sz; if (live_bytes_ > peak_bytes_) peak_bytes_ = live_bytes_;

@@ -73,6 +73,7 @@ public:
         if (it == records_.end()) { r.error = make_error(ErrorCode::invalid_handle, "realloc of unknown handle"); return r; }
         if (req.size > bounds_.max_allocation_size) { r.error = make_error(ErrorCode::size_too_large, "too large"); return r; }
         std::size_t align = req.alignment ? req.alignment : it->second.alignment;
+        if (!is_power_of_two(align)) { r.error = make_error(ErrorCode::invalid_alignment, "alignment must be power of two"); return r; }
         if (align > max_align_) { r.error = make_error(ErrorCode::alignment_unsupported, "alignment exceeds max"); return r; }
         void* np = detail::aligned_alloc(req.size == 0 ? 1 : req.size, align);
         if (!np) { r.error = make_error(ErrorCode::out_of_memory, "realloc failed; original preserved"); return r; }
@@ -81,7 +82,8 @@ public:
         detail::aligned_free(it->second.ptr);
         if (live_bytes_ >= it->second.size) live_bytes_ -= it->second.size;
         live_bytes_ += req.size;
-        granted_bytes_ += (req.size > it->second.size ? req.size - it->second.size : 0);
+        // Asked for req.size, granted req.size: the two totals move together.
+        granted_bytes_ += req.size;
         requested_bytes_ += req.size;
         if (live_bytes_ > peak_bytes_) peak_bytes_ = live_bytes_;
         it->second.ptr = np; it->second.size = req.size; it->second.alignment = align; it->second.tag = req.tag;

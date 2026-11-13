@@ -56,7 +56,11 @@ public:
         void* p = nullptr;
         cudaError_t e = cudaMalloc(&p, sz);
         if (e != cudaSuccess) { r.error = make_error(cuda_to_error(e), cuda_error_message(e)); return r; }
-        if (p && any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(p, req.size);
+        // Device memory is not host-addressable: it is zeroed on the device.
+        if (p && req.size && any(req.flags & AllocationFlags::ZeroFill)) {
+            cudaError_t ze = cudaMemset(p, 0, req.size);
+            if (ze != cudaSuccess) { cudaFree(p); r.error = make_error(cuda_to_error(ze), cuda_error_message(ze)); ++failures_; return r; }
+        }
         AllocationId id = ++next_id_;
         records_.emplace(id, Record{ p, sz });
         r.error = Error{}; r.id = id; r.address = p; r.size = req.size; r.alignment = 256;

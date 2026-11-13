@@ -39,19 +39,22 @@ public:
         std::lock_guard lock(mutex_);
         AllocationResult r;
         if (req.size > object_size_) { r.error = make_error(ErrorCode::size_too_large, "object exceeds pool object_size"); return r; }
+        if (!is_power_of_two(align_)) { r.error = make_error(ErrorCode::invalid_config, "pool alignment must be a power of two"); return r; }
         std::size_t want_align = req.alignment ? req.alignment : align_;
         if (!is_power_of_two(want_align) || want_align > align_) { r.error = make_error(ErrorCode::alignment_unsupported, "alignment not supported by pool"); return r; }
-        bool grow = free_list_.empty();
-        if (grow) {
-            if (total_slots_ + block_slots() > capacity_) { r.error = make_error(ErrorCode::capacity_exceeded, "pool capacity reached"); ++failures_; return r; }
-            grow_block();
+        // A slot that was freed is reused first. A slot that has never been handed
+        // out is fresh backing, however long ago its block was acquired.
+        if (free_list_.empty() && fresh_list_.empty()) {
+            if (total_slots_ >= capacity_) { r.error = make_error(ErrorCode::capacity_exceeded, "pool capacity reached"); ++failures_; return r; }
+            // The last block is as large as the capacity still allows.
+            const std::size_t room = capacity_ - total_slots_;
+            if (!grow_block(room < block_slots() ? room : block_slots())) { r.error = make_error(ErrorCode::out_of_memory, "pool growth failed"); ++failures_; return r; }
             ++growth_events_;
-            ++fresh_allocs_;
         }
-        if (free_list_.empty()) { r.error = make_error(ErrorCode::out_of_memory, "pool growth failed"); ++failures_; return r; }
-        void* slot = free_list_.back(); free_list_.pop_back();
-        bool reused = !grow;
-        if (reused) { ++pool_hits_; ++reuse_count_; ++same_size_reuse_; }
+        const bool reused = !free_list_.empty();
+        void* slot = nullptr;
+        if (reused) { slot = free_list_.back(); free_list_.pop_back(); ++pool_hits_; ++reuse_count_; ++same_size_reuse_; reuse_bytes_ += object_size_; }
+        else { slot = fresh_list_.back(); fresh_list_.pop_back(); ++fresh_allocs_; }
         if (any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(slot, object_size_);
         if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(slot, object_size_, detail::kPoisonAllocByte);
         AllocationId id = ++next_id_;
@@ -70,8 +73,8 @@ public:
         if (poison_on_free_) detail::fill_poison(it->second, object_size_, detail::kPoisonFreeByte);
         free_list_.push_back(it->second);
         live_.erase(it);
-        if (live_count_) --live_count_; if (live_bytes_ >= object_size_) live_bytes_ -= object_size_;
-        ++same_size_reuse_;
+        if (live_count_) --live_count_;
+        if (live_bytes_ >= object_size_) live_bytes_ -= object_size_;
         return Error{};
     }
 
@@ -86,10 +89,10 @@ public:
 
     Error reset() override {
         std::lock_guard lock(mutex_);
-        free_list_.clear();
+        free_list_.clear(); fresh_list_.clear();
         for (auto* b : blocks_) detail::aligned_free(b);
         blocks_.clear(); live_.clear();
-        total_slots_ = 0; live_count_ = 0; live_bytes_ = 0;
+        total_slots_ = 0; reserved_bytes_ = 0; live_count_ = 0; live_bytes_ = 0;
         return Error{};
     }
 
@@ -106,7 +109,7 @@ public:
         s.allocator_id = id_; s.name = name_;
         s.live.live_count = live_count_; s.live.live_bytes = live_bytes_;
         s.live.peak_live_count = peak_live_; s.live.peak_live_bytes = peak_bytes_;
-        s.live.reserved = static_cast<std::uint64_t>(blocks_.size()) * block_bytes_;
+        s.live.reserved = reserved_bytes_;   // blocks may differ in size
         s.live.committed = s.live.reserved; s.live.peak_reserved = s.live.reserved; s.live.peak_committed = s.live.reserved;
         s.accounting.total_requested_bytes = requested_bytes_;
         s.accounting.total_granted_bytes = granted_bytes_;
@@ -115,7 +118,7 @@ public:
         s.reuse.pool_hits = pool_hits_; s.reuse.fresh_allocations = fresh_allocs_;
         s.reuse.reuse_count = reuse_count_; s.reuse.same_size_reuse = same_size_reuse_;
         s.reuse.trim_recovery_bytes = 0;
-        s.reuse.backing_retained_after_workload = static_cast<std::uint64_t>(blocks_.size()) * block_bytes_;
+        s.reuse.backing_retained_after_workload = reserved_bytes_;
         s.fragmentation.internal_observable = true; s.fragmentation.external_observable = false;
         s.fragmentation.internal_fragmentation = granted_bytes_ > 0 ? 1.0 - (double)requested_bytes_ / (double)granted_bytes_ : 0.0;
         s.success_count = success_; s.failure_count = failures_;
@@ -125,29 +128,33 @@ public:
     void shutdown() noexcept override {
         std::lock_guard lock(mutex_);
         for (auto* b : blocks_) detail::aligned_free(b);
-        blocks_.clear(); free_list_.clear(); live_.clear();
+        blocks_.clear(); free_list_.clear(); fresh_list_.clear(); live_.clear();
+        total_slots_ = 0; reserved_bytes_ = 0;
         live_count_ = 0; live_bytes_ = 0;
     }
 
 private:
     std::size_t block_slots() const { return block_slots_; }
-    void grow_block() {
-        std::size_t n = block_slots_;
+    bool grow_block(std::size_t n) {
         std::size_t bytes = slot_stride_ * n;
         if (bytes < align_) bytes = align_;
         void* base = detail::aligned_alloc(bytes, align_);
-        if (!base) return;
+        if (!base) return false;
         blocks_.push_back(base);
         block_bytes_ = bytes;
+        reserved_bytes_ += bytes;
         char* p = static_cast<char*>(base);
-        for (std::size_t i = 0; i < n; ++i) free_list_.push_back(p + i * slot_stride_);
+        for (std::size_t i = 0; i < n; ++i) fresh_list_.push_back(p + i * slot_stride_);
         total_slots_ += n;
         fresh_bytes_ += bytes;
+        return true;
     }
 
     mutable std::mutex mutex_;
     std::unordered_map<AllocationId, void*> live_;
-    std::vector<void*> free_list_;
+    std::vector<void*> free_list_;    // slots that were handed out and freed
+    std::vector<void*> fresh_list_;   // slots that were never handed out
+    std::uint64_t reserved_bytes_ = 0;
     std::vector<void*> blocks_;
     AllocationId next_id_ = 0;
     std::size_t object_size_ = 0, align_ = 0, slot_stride_ = 0, capacity_ = 0;

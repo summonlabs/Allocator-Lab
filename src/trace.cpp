@@ -48,12 +48,26 @@ public:
 
 private:
     void skip_ws() { while (pos_ < s_.size() && std::isspace(static_cast<unsigned char>(s_[pos_]))) ++pos_; }
+    // Nesting is bounded: a trace is an object holding an array of flat objects,
+    // and input that nests deeper is refused before it can exhaust the stack.
+    struct Depth {
+        std::size_t& d;
+        explicit Depth(std::size_t& depth) : d(depth) { ++d; }
+        ~Depth() { --d; }
+        Depth(const Depth&) = delete;
+        Depth& operator=(const Depth&) = delete;
+    };
+    static constexpr std::size_t kMaxDepth = 64;
+
     bool parse_value(Json& v) {
         skip_ws();
         if (pos_ >= s_.size()) return false;
         char c = s_[pos_];
-        if (c == '{') return parse_object(v);
-        if (c == '[') return parse_array(v);
+        if (c == '{' || c == '[') {
+            if (depth_ >= kMaxDepth) return false;
+            Depth guard(depth_);
+            return c == '{' ? parse_object(v) : parse_array(v);
+        }
         if (c == '"') { v.type = Json::String; return parse_string(v.str); }
         if (c == 't') return parse_lit("true", v);
         if (c == 'f') return parse_lit("false", v);
@@ -144,6 +158,7 @@ private:
 
     const std::string& s_;
     std::size_t pos_ = 0;
+    std::size_t depth_ = 0;
 };
 
 std::string json_escape(const std::string& in) {
@@ -208,8 +223,11 @@ Error trace_from_json(const std::string& text, Trace& out) {
         if (item.type != Json::Object) return make_error(ErrorCode::trace_malformed, "entry not an object");
         TraceEntry e;
         auto need_uint = [&](const char* k, std::uint64_t& o) -> bool { const Json* p = item.get(k); if (!p || !p->is_uint) return false; o = p->uval; return true; };
-        auto need_int = [&](const char* k, int& o) -> bool { std::uint64_t u; if (!need_uint(k, u)) return false; o = static_cast<int>(u); return true; };
-        int op = -1, domain = -1, worker_i = 0, tag_i = 0;
+        // A value that does not fit the field is malformed; it is never wrapped into range.
+        auto need_int = [&](const char* k, int& o) -> bool { std::uint64_t u; if (!need_uint(k, u) || u > 0x7fffffffu) return false; o = static_cast<int>(u); return true; };
+        auto need_u32 = [&](const char* k, std::uint32_t& o) -> bool { std::uint64_t u; if (!need_uint(k, u) || u > 0xffffffffu) return false; o = static_cast<std::uint32_t>(u); return true; };
+        int op = -1, domain = -1;
+        std::uint32_t worker_i = 0, tag_i = 0;
         if (!need_uint("seq", e.seq)) return make_error(ErrorCode::trace_malformed, "entry missing seq");
         if (!need_uint("step", e.step)) return make_error(ErrorCode::trace_malformed, "entry missing step");
         if (!need_int("op", op) || op < 0 || op > 6) return make_error(ErrorCode::trace_malformed, "malformed op value");
@@ -217,11 +235,11 @@ Error trace_from_json(const std::string& text, Trace& out) {
         if (!need_uint("size", e.size)) return make_error(ErrorCode::trace_malformed, "entry missing size");
         if (!need_uint("alignment", e.alignment)) return make_error(ErrorCode::trace_malformed, "entry missing alignment");
         if (!need_int("domain", domain) || domain < 0 || domain > 5) return make_error(ErrorCode::trace_malformed, "malformed domain value");
-        if (!need_int("worker", worker_i)) return make_error(ErrorCode::trace_malformed, "entry missing worker");
-        if (!need_int("tag", tag_i)) return make_error(ErrorCode::trace_malformed, "entry missing tag");
+        if (!need_u32("worker", worker_i)) return make_error(ErrorCode::trace_malformed, "entry missing worker");
+        if (!need_u32("tag", tag_i)) return make_error(ErrorCode::trace_malformed, "entry missing tag");
         e.op = static_cast<TraceOperationType>(op);
         e.domain = static_cast<MemoryDomain>(domain);
-        e.worker = static_cast<WorkerId>(worker_i); e.tag = static_cast<std::uint32_t>(tag_i);
+        e.worker = static_cast<WorkerId>(worker_i); e.tag = tag_i;
         if (const Json* ph = item.get("has_status")) { if (ph->type != Json::Bool) return make_error(ErrorCode::trace_malformed, "invalid has_status"); e.has_status = ph->b; }
         if (e.has_status) {
             if (const Json* ps = item.get("status_success")) { if (ps->type != Json::Bool) return make_error(ErrorCode::trace_malformed, "invalid status_success"); e.status_success = ps->b; }
@@ -266,10 +284,14 @@ Error trace_from_binary(const std::vector<std::uint8_t>& bytes, Trace& out) {
     if (!rd_u64(seed)) return make_error(ErrorCode::trace_malformed, "truncated seed");
     std::uint32_t name_len = 0;
     if (!rd_u32(name_len) || p + name_len > bytes.size()) return make_error(ErrorCode::trace_malformed, "truncated name");
-    std::string name(reinterpret_cast<const char*>(&bytes[p]), name_len); p += name_len;
     if (name_len > 1u << 24) return make_error(ErrorCode::trace_malformed, "oversized name");
+    std::string name(reinterpret_cast<const char*>(bytes.data() + p), name_len); p += name_len;
     std::uint32_t count = 0;
     if (!rd_u32(count)) return make_error(ErrorCode::trace_malformed, "truncated count");
+    // Every entry occupies kEntryBytes: a count the remaining bytes cannot hold is
+    // malformed, and nothing is reserved for it.
+    constexpr std::size_t kEntryBytes = 68;
+    if (count > (bytes.size() - p) / kEntryBytes) return make_error(ErrorCode::trace_malformed, "entry count exceeds the data");
     out = Trace{}; out.version = version; out.seed = seed; out.name = name; out.entries.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         TraceEntry e;

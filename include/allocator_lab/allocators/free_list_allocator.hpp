@@ -24,7 +24,8 @@ public:
     FreeListAllocator(std::size_t superblock_size = 256u * 1024, std::size_t max_bytes = size_t(-1),
                       std::string name = "free_list", std::uint64_t field_id = 0)
         : AllocatorBase(field_id, std::move(name), AllocatorKind::FreeList),
-          superblock_size_(superblock_size), max_bytes_(max_bytes) {
+          // Zero means "the default": a superblock always has room for a block.
+          superblock_size_(superblock_size ? superblock_size : 256u * 1024), max_bytes_(max_bytes) {
         AllocatorCapabilities c;
         c.supports_allocate = true; c.supports_free = true; c.supports_query = true;
         c.supports_trim = true; c.supports_reset = true;
@@ -60,7 +61,6 @@ public:
         if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(p, req.size, detail::kPoisonAllocByte);
         AllocationId id = ++next_id_;
         live_.emplace(id, b);
-        b->id = id;
         r.error = Error{}; r.id = id; r.address = p; r.size = granted; r.alignment = align; r.reused_backing = (blocks_freed_ > 0);
         return r;
     }
@@ -146,8 +146,9 @@ private:
         Block* next_free;
         Block* arena_base;
         std::size_t arena_total;   // full superblock size (valid at arena_base)
-        AllocationId id;
     };
+    // The payload starts right after the header: nothing of Block may reach into it.
+    static_assert(sizeof(Block) <= 48, "Block must fit in header_size");
     struct Footer { std::size_t size; bool busy; };
 
     static constexpr std::size_t header_size = 48;  // aligned Block
@@ -207,7 +208,8 @@ private:
         // Right neighbor
         Block* right = reinterpret_cast<Block*>(static_cast<char*>(static_cast<void*>(b)) + b->size);
         char* arena_start = static_cast<char*>(static_cast<void*>(b->arena_base));
-        char* arena_end = arena_start + b->arena_total;
+        // The superblock size is recorded in its first block only.
+        char* arena_end = arena_start + b->arena_base->arena_total;
         char* right_addr = static_cast<char*>(static_cast<void*>(right));
         bool right_in_arena = right_addr >= arena_start && right_addr < arena_end;
         if (right_in_arena && right->magic == kMagicFree) {

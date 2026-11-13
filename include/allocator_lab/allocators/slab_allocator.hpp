@@ -25,8 +25,11 @@ public:
         : AllocatorBase(field_id, std::move(name), AllocatorKind::Slab),
           object_size_(object_size), page_size_(page_size), max_bytes_(max_bytes) {
         slot_stride_ = align_up(object_size_ > 16 ? object_size_ : 16, 16);
-        total_slots_per_slab_ = (page_size_ - header_size) / slot_stride_;
-        if (total_slots_per_slab_ == 0) total_slots_per_slab_ = 1;
+        // A slab is one power-of-two page with room for at least one whole slot
+        // after its header. Anything else cannot hold an object and is refused.
+        config_ok_ = is_power_of_two(page_size_) && page_size_ > header_size &&
+                     slot_stride_ <= page_size_ - header_size;
+        total_slots_per_slab_ = config_ok_ ? (page_size_ - header_size) / slot_stride_ : 0;
         AllocatorCapabilities c;
         c.supports_allocate = true; c.supports_free = true; c.supports_query = true;
         c.supports_trim = true; c.supports_reset = true;
@@ -39,6 +42,7 @@ public:
     AllocationResult allocate(const AllocationRequest& req) override {
         std::lock_guard lock(mutex_);
         AllocationResult r;
+        if (!config_ok_) { r.error = make_error(ErrorCode::invalid_config, "slab page cannot hold an object of this size"); return r; }
         if (req.size > object_size_) { r.error = make_error(ErrorCode::size_too_large, "object exceeds slab object_size"); return r; }
         std::size_t align = req.alignment ? req.alignment : 16;
         if (!is_power_of_two(align) || align > 16) { r.error = make_error(ErrorCode::alignment_unsupported, "slab supports 16-byte alignment"); return r; }
@@ -48,8 +52,11 @@ public:
             slab = &slabs_.back();
             ++growth_events_;
         }
-        void* slot = slab->free_list.back(); slab->free_list.pop_back();
-        bool reused = slab->free_list.size() < slab->total_slots;
+        // A slot that was freed is reused first; one never handed out is fresh backing.
+        const bool reused = !slab->free_list.empty();
+        void* slot = nullptr;
+        if (reused) { slot = slab->free_list.back(); slab->free_list.pop_back(); }
+        else { slot = slab->fresh_list.back(); slab->fresh_list.pop_back(); }
         if (any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(slot, object_size_);
         if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(slot, object_size_, detail::kPoisonAllocByte);
         AllocationId id = ++next_id_;
@@ -72,8 +79,8 @@ public:
         if (poison_on_free_) detail::fill_poison(slot, object_size_, detail::kPoisonFreeByte);
         slab->free_list.push_back(slot);
         live_.erase(it);
-        if (live_count_) --live_count_; if (live_bytes_ >= object_size_) live_bytes_ -= object_size_;
-        ++same_size_reuse_;
+        if (live_count_) --live_count_;
+        if (live_bytes_ >= object_size_) live_bytes_ -= object_size_;
         return Error{};
     }
 
@@ -135,8 +142,11 @@ private:
     struct Slab {
         char* base = nullptr;
         std::size_t total_slots = 0;
-        std::vector<void*> free_list;
+        std::vector<void*> free_list;    // slots that were handed out and freed
+        std::vector<void*> fresh_list;   // slots that were never handed out
         std::uint64_t magic = kMagic;
+        bool has_room() const { return !free_list.empty() || !fresh_list.empty(); }
+        bool unused() const { return free_list.size() + fresh_list.size() == total_slots; }
     };
 
     static std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) & ~(a - 1); }
@@ -149,7 +159,7 @@ private:
     }
 
     Slab* find_slab_with_free() {
-        for (auto& s : slabs_) if (!s.free_list.empty()) return &s;
+        for (auto& s : slabs_) if (s.has_room()) return &s;
         return nullptr;
     }
 
@@ -161,7 +171,7 @@ private:
         s.base = static_cast<char*>(base);
         s.total_slots = total_slots_per_slab_;
         char* p = s.base + header_size;
-        for (std::size_t i = 0; i < s.total_slots; ++i) s.free_list.push_back(p + i * slot_stride_);
+        for (std::size_t i = 0; i < s.total_slots; ++i) s.fresh_list.push_back(p + i * slot_stride_);
         slabs_.push_back(s);
         total_bytes_ += page_size_;
         if (total_bytes_ > peak_total_) peak_total_ = total_bytes_;
@@ -170,7 +180,7 @@ private:
 
     void release_empty_slabs() {
         for (auto it = slabs_.begin(); it != slabs_.end();) {
-            if (it->free_list.size() == it->total_slots) {
+            if (it->unused()) {
                 detail::aligned_free(it->base);
                 trim_recovered_bytes_ += page_size_;
                 total_bytes_ -= page_size_;
@@ -192,6 +202,7 @@ private:
     std::uint64_t success_ = 0, failures_ = 0, growth_events_ = 0, trim_count_ = 0;
     std::uint64_t trim_recovered_bytes_ = 0, peak_total_ = 0;
     bool poison_on_free_ = false;
+    bool config_ok_ = false;
     Bounds bounds_;
 };
 

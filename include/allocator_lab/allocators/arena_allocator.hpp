@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
@@ -44,12 +45,18 @@ public:
         if (req.size > bounds_.max_allocation_size) { r.error = make_error(ErrorCode::size_too_large, "too large"); return r; }
         std::size_t align = req.alignment ? req.alignment : detail::default_alignment;
         if (!is_power_of_two(align) || align > 4096) { r.error = make_error(ErrorCode::alignment_unsupported, "alignment unsupported"); return r; }
-        std::size_t padded = round_up_pow2_padded(req.size == 0 ? 1 : req.size, align);
-        if (current_ + padded > cap_) {
-            if (!ensure_block(padded)) { r.error = make_error(ErrorCode::out_of_memory, "arena could not grow"); ++failures_; return r; }
+        const std::size_t sz = req.size == 0 ? 1 : req.size;
+        // The address is aligned, not only the size: bump to the next multiple of
+        // `align` counted from the block base (blocks are 4096-aligned).
+        std::size_t start = round_up_pow2_padded(current_, align);
+        if (!base_ || start > cap_ || sz > cap_ - start) {
+            if (!ensure_block(sz)) { r.error = make_error(ErrorCode::out_of_memory, "arena could not grow"); ++failures_; return r; }
+            start = 0;
         }
-        void* p = base_ + current_;
-        current_ += padded;
+        const std::size_t padded = (start - current_) + sz;   // skipped bytes plus the object
+        alignment_waste_ += start - current_;
+        void* p = base_ + start;
+        current_ = start + sz;
         if (current_ > high_ ) high_ = current_;
         if (any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(p, req.size);
         if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(p, req.size, detail::kPoisonAllocByte);
@@ -83,7 +90,7 @@ public:
         // live allocations are still in use; treated as a barrier / reinitialization.
         for (auto* b : blocks_) detail::aligned_free(b);
         blocks_.clear();
-        base_ = nullptr; current_ = 0; cap_ = 0; high_ = 0;
+        base_ = nullptr; current_ = 0; cap_ = 0; high_ = 0; reserved_total_ = 0;
         live_.clear(); live_size_.clear();
         live_count_ = 0; live_bytes_ = 0;
         return Error{};
@@ -95,15 +102,17 @@ public:
         s.allocator_id = id_; s.name = name_;
         s.live.live_count = live_count_; s.live.live_bytes = live_bytes_;
         s.live.peak_live_count = peak_live_; s.live.peak_live_bytes = peak_bytes_;
-        s.live.reserved = cap_; s.live.committed = cap_; s.live.peak_reserved = peak_cap_ > cap_ ? peak_cap_ : cap_;
+        // Every block the arena holds counts, not only the one being filled.
+        s.live.reserved = reserved_total_; s.live.committed = reserved_total_;
+        s.live.peak_reserved = peak_cap_ > reserved_total_ ? peak_cap_ : reserved_total_;
         s.accounting.total_requested_bytes = requested_bytes_;
         s.accounting.total_granted_bytes = granted_bytes_;
         s.accounting.internal_waste = granted_bytes_ - requested_bytes_;
         s.accounting.alignment_waste = alignment_waste_;
         s.reuse.fresh_allocations = growth_events_;
-        s.reuse.backing_retained_after_workload = cap_;
+        s.reuse.backing_retained_after_workload = reserved_total_;
         s.fragmentation.internal_observable = true; s.fragmentation.external_observable = false;
-        s.fragmentation.internal_fragmentation = cap_ > 0 ? 1.0 - (double)live_bytes_ / (double)cap_ : 0.0;
+        s.fragmentation.internal_fragmentation = reserved_total_ > 0 ? 1.0 - (double)live_bytes_ / (double)reserved_total_ : 0.0;
         s.success_count = success_; s.failure_count = failures_;
         return s;
     }
@@ -112,7 +121,7 @@ public:
         std::lock_guard lock(mutex_);
         for (auto* b : blocks_) detail::aligned_free(b);
         blocks_.clear(); live_.clear(); live_size_.clear();
-        base_ = nullptr; current_ = 0; cap_ = 0;
+        base_ = nullptr; current_ = 0; cap_ = 0; reserved_total_ = 0;
         live_count_ = 0; live_bytes_ = 0;
     }
 
@@ -124,14 +133,16 @@ private:
     bool ensure_block(std::size_t need) {
         std::size_t sz = block_size_;
         if (sz < need) sz = round_up_pow2_padded(need, 4096);
-        if (cap_ + sz > max_bytes_) return false;
+        // The bound is on everything the arena holds, across all of its blocks.
+        if (reserved_total_ > max_bytes_ || sz > max_bytes_ - reserved_total_) return false;
         void* b = detail::aligned_alloc(sz, 4096);
         if (!b) return false;
         blocks_.push_back(b);
         base_ = static_cast<char*>(b);
         current_ = 0; cap_ = sz;
+        reserved_total_ += sz;
         ++growth_events_;
-        if (cap_ > peak_cap_) peak_cap_ = cap_;
+        if (reserved_total_ > peak_cap_) peak_cap_ = reserved_total_;
         return true;
     }
 
@@ -142,6 +153,7 @@ private:
     AllocationId next_id_ = 0;
     char* base_ = nullptr;
     std::size_t current_ = 0, cap_ = 0, high_ = 0;
+    std::size_t reserved_total_ = 0;   // sum of all blocks
     std::size_t block_size_ = 0, max_bytes_ = 0;
     std::size_t growth_events_ = 0;
     std::uint64_t live_count_ = 0, live_bytes_ = 0, peak_live_ = 0, peak_bytes_ = 0;

@@ -125,3 +125,36 @@ TEST(adversarial_pool_reuse_no_poison_leak) {
     REQUIRE(r.reused_backing);
     a.free(r.id);
 }
+
+TEST(adversarial_binary_trace_count_is_bounded) {
+    // A header that announces four billion entries and brings none.
+    std::vector<std::uint8_t> bytes;
+    auto put_u32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF)); };
+    put_u32(kTraceMagic); put_u32(kTraceVersion);
+    put_u32(0); put_u32(0);                // seed
+    put_u32(0);                            // name length
+    put_u32(0xFFFFFFFFu);                  // entry count
+    Trace out;
+    Error err = trace_from_binary(bytes, out);
+    REQUIRE(err.code == ErrorCode::trace_malformed);
+}
+
+TEST(adversarial_json_trace_rejects_out_of_range_fields) {
+    // op 4294967296 is not an operation; it must not be read as operation 0.
+    const std::string text =
+        "{\"version\":1,\"seed\":0,\"name\":\"x\",\"entries\":["
+        "{\"seq\":0,\"step\":0,\"op\":4294967296,\"id\":1,\"size\":16,\"alignment\":0,\"domain\":0,\"worker\":0,\"tag\":0}]}";
+    Trace out;
+    REQUIRE(trace_from_json(text, out).code == ErrorCode::trace_malformed);
+    const std::string worker =
+        "{\"version\":1,\"seed\":0,\"name\":\"x\",\"entries\":["
+        "{\"seq\":0,\"step\":0,\"op\":0,\"id\":1,\"size\":16,\"alignment\":0,\"domain\":0,\"worker\":4294967301,\"tag\":0}]}";
+    REQUIRE(trace_from_json(worker, out).code == ErrorCode::trace_malformed);
+}
+
+// Kept last in this file: without a nesting bound this input overflows the stack.
+TEST(adversarial_json_trace_depth_is_bounded) {
+    const std::string deep(200000, '[');
+    Trace out;
+    REQUIRE(!trace_from_json(deep, out).ok());
+}

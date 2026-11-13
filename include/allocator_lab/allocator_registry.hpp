@@ -35,8 +35,13 @@ public:
         std::unique_lock lock(mutex_);
         AllocatorId id = strategy->id();
         if (id == 0) {
-            id = ids_.next();
+            // Never hand out an id that a self-identified strategy already holds.
+            do { id = ids_.next(); } while (id_to_strategy_.count(id) != 0);
             strategy->set_id(id);
+        } else if (id_to_strategy_.count(id) != 0) {
+            // The id belongs to another strategy: this one is not registered, and
+            // the caller is not given an id that would resolve to the other one.
+            return 0;
         }
         id_to_strategy_.emplace(id, std::move(strategy));
         return id;

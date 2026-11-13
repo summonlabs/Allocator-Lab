@@ -152,7 +152,9 @@ private:
     void update_accounting_realloc(std::size_t oldsz, std::size_t newsz) {
         if (live_bytes_ >= oldsz) live_bytes_ -= oldsz; else live_bytes_ = 0;
         live_bytes_ += newsz;
-        granted_bytes_ += (newsz > oldsz ? newsz - oldsz : 0);
+        // A reallocation asks for newsz and is granted newsz: both totals move by
+        // the same amount, so the waste (granted - requested) cannot go negative.
+        granted_bytes_ += newsz;
         requested_bytes_ += newsz;
         if (live_bytes_ > peak_bytes_) peak_bytes_ = live_bytes_;
     }

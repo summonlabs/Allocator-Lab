@@ -127,3 +127,95 @@ TEST(property_same_trace_replays_on_multiple_allocators) {
         a->shutdown();
     }
 }
+
+namespace {
+// Hands out the same buffer for every allocation. Whatever is written through
+// one allocation is seen through all the others.
+class SingleBufferAllocator : public AllocatorStrategy {
+public:
+    SingleBufferAllocator() : buffer_(256, 0x5A) { caps_.supports_free = true; caps_.domains = { MemoryDomain::Host }; }
+    AllocatorId id() const noexcept override { return 77; }
+    const std::string& name() const noexcept override { return name_; }
+    AllocatorKind kind() const noexcept override { return AllocatorKind::Custom; }
+    const AllocatorCapabilities& capabilities() const noexcept override { return caps_; }
+    AllocationResult allocate(const AllocationRequest& req) override {
+        AllocationResult r;
+        if (req.size > buffer_.size()) { r.error = make_error(ErrorCode::size_too_large, "too large"); return r; }
+        r.id = ++next_; r.address = buffer_.data(); r.size = req.size; r.alignment = 1;
+        return r;
+    }
+    Error free(AllocationHandle) override { return Error{}; }
+    Error query(AllocationHandle, AllocationInfo&) override { return make_error(ErrorCode::not_supported, "no query"); }
+    AllocatorStatistics statistics() const override { return AllocatorStatistics{}; }
+    void shutdown() noexcept override {}
+    bool untouched() const { for (std::uint8_t b : buffer_) if (b != 0x5A) return false; return true; }
+private:
+    std::vector<std::uint8_t> buffer_;
+    AllocationId next_ = 0;
+    std::string name_ = "single_buffer";
+    AllocatorCapabilities caps_;
+};
+
+Trace two_live_then_freed() {
+    Trace t; t.version = kTraceVersion; t.name = "overlap";
+    auto add = [&](TraceOperationType op, AllocationId id) {
+        TraceEntry e; e.seq = t.entries.size(); e.step = e.seq; e.op = op; e.id = id; e.size = 64;
+        t.entries.push_back(e);
+    };
+    add(TraceOperationType::Allocate, 1);
+    add(TraceOperationType::Allocate, 2);
+    add(TraceOperationType::Free, 1);
+    add(TraceOperationType::Free, 2);
+    return t;
+}
+}  // namespace
+
+TEST(experiment_leaves_payload_alone_unless_asked) {
+    SingleBufferAllocator a;
+    ExperimentConfig ec; ec.verify_payload = false;
+    ExperimentResult res = run_replay(a, two_live_then_freed(), ec, BuildProvenance{});
+    REQUIRE_EQ(res.success_count, 4u);
+    REQUIRE(a.untouched());                     // no pattern was written into the allocations
+}
+
+TEST(experiment_reports_payload_corruption) {
+    SingleBufferAllocator a;                    // the second allocation overwrites the first
+    ExperimentConfig ec; ec.verify_payload = true;
+    ExperimentResult res = run_replay(a, two_live_then_freed(), ec, BuildProvenance{});
+    REQUIRE(!a.untouched());
+    REQUIRE(res.failure_count > 0);             // the damaged payload is a failure of the run
+}
+
+TEST(experiment_warmup_is_not_timed) {
+    WorkloadConfig wc; wc.operations = 400; wc.live_target = 32; wc.seed = 11;
+    wc.size_dist = SizeDistribution::Fixed; wc.min_size = 64; wc.max_size = 64;
+    Trace trace; REQUIRE(generate_workload(wc, trace).ok());
+    SystemAllocator a;
+    ExperimentConfig ec; ec.warmup_ops = trace.entry_count();   // everything is warm-up
+    ExperimentResult res = run_replay(a, trace, ec, BuildProvenance{});
+    REQUIRE(res.success_count > 0);             // the operations ran
+    REQUIRE_EQ(res.alloc_latency.n, 0u);        // none of them was measured
+    REQUIRE_EQ(res.free_latency.n, 0u);
+    REQUIRE_EQ(res.elapsed_ns, 0u);
+    a.shutdown();
+}
+
+#ifdef ALLOCATOR_LAB_TEST_HAS_CUDA
+TEST(experiment_does_not_write_into_device_memory) {
+    CudaDirectAllocator a;
+    {
+        AllocationRequest probe; probe.size = 64; probe.domain = MemoryDomain::Device;
+        AllocationResult r = a.allocate(probe);
+        if (!r.error.ok()) { std::cout << "[SKIP] no CUDA device: " << r.error.message << "\n"; return; }
+        REQUIRE(a.free(r.id).ok());
+    }
+    WorkloadConfig wc; wc.operations = 64; wc.live_target = 8; wc.seed = 5; wc.realloc_fraction = 0.0;
+    wc.size_dist = SizeDistribution::Fixed; wc.min_size = 4096; wc.max_size = 4096; wc.domain = MemoryDomain::Device;
+    Trace trace; REQUIRE(generate_workload(wc, trace).ok());
+    ExperimentConfig ec; ec.verify_payload = true;              // asked for, but device memory is not host memory
+    ExperimentResult res = run_replay(a, trace, ec, BuildProvenance{});
+    REQUIRE(res.success_count > 0);
+    REQUIRE_EQ(a.statistics().live.live_count, 0u);
+    a.shutdown();
+}
+#endif

@@ -58,6 +58,10 @@ public:
             if (!region_) { CloseHandle(mapping_); mapping_ = nullptr; set_capabilities(basic_caps(false, "MapViewOfFile failed")); return; }
             SharedHeader* h = reinterpret_cast<SharedHeader*>(region_);
             if (h->magic != kSharedMagic) { UnmapViewOfFile(region_); CloseHandle(mapping_); region_=nullptr; mapping_=nullptr; set_capabilities(basic_caps(false, "shared object magic mismatch (stale/corrupt)")); return; }
+            // The object has the size its creator gave it, whatever size was passed
+            // here: allocation stays inside what is mapped.
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(region_, &mbi, sizeof(mbi)) != 0 && mbi.RegionSize != 0) total_bytes_ = mbi.RegionSize;
             init_ok_ = true;
         }
         (void)kMagic;
@@ -72,7 +76,8 @@ public:
             return;
         }
         AllocatorCapabilities c;
-        c.supports_allocate = true; c.supports_free = true; c.supports_query = true;
+        // Arena-like: free() always answers not_supported, and says so here too.
+        c.supports_allocate = true; c.supports_free = false; c.supports_query = true;
         c.supports_reset = false; c.supports_trim = false;
         c.is_thread_safe = true;
         c.allows_per_object_free = false;
@@ -93,19 +98,24 @@ public:
         std::size_t align = req.alignment ? req.alignment : 16;
         if (!is_power_of_two(align) || align > 4096) { r.error = make_error(ErrorCode::alignment_unsupported, "shared supports up to 4096-byte alignment"); return r; }
         std::size_t sz = req.size == 0 ? 1 : req.size;
-        std::size_t aligned = align_up(sz, align > 16 ? align : 16);
+        if (sz > total_bytes_) { r.error = make_error(ErrorCode::capacity_exceeded, "shared region capacity reached"); ++failures_; return r; }
+        const std::uint64_t span = align_up(sz, 16);
         SharedHeader* h = reinterpret_cast<SharedHeader*>(region_);
         volatile LONGLONG* next = reinterpret_cast<volatile LONGLONG*>(&h->next);
         for (;;) {
             LONGLONG cur = InterlockedCompareExchange64(next, 0, 0);
-            if (cur + static_cast<LONGLONG>(aligned) > static_cast<LONGLONG>(total_bytes_)) {
+            // The address is aligned, not only the size: the block starts at the
+            // next multiple of `align` (the view itself is page-aligned).
+            const std::uint64_t ucur = static_cast<std::uint64_t>(cur);
+            const std::uint64_t start = (ucur + (align - 1)) & ~static_cast<std::uint64_t>(align - 1);
+            if (cur < 0 || start < ucur || start > total_bytes_ || span > total_bytes_ - start) {
                 r.error = make_error(ErrorCode::capacity_exceeded, "shared region capacity reached");
                 ++failures_;
                 return r;
             }
-            LONGLONG reserve = cur + static_cast<LONGLONG>(aligned);
+            LONGLONG reserve = static_cast<LONGLONG>(start + span);
             if (InterlockedCompareExchange64(next, reserve, cur) == cur) {
-                std::uint64_t offset = static_cast<std::uint64_t>(cur);
+                std::uint64_t offset = start;
                 void* p = static_cast<void*>(region_ + offset);
                 if (any(req.flags & AllocationFlags::ZeroFill)) detail::fill_zero(p, sz);
                 if (any(req.flags & AllocationFlags::PoisonAlloc)) detail::fill_poison(p, sz, detail::kPoisonAllocByte);
@@ -143,11 +153,13 @@ public:
     AllocatorStatistics statistics() const override {
         std::lock_guard lock(mutex_);
         AllocatorStatistics s;
-        s.allocator_id = id_; s.name = name_;
+        // The allocator's own name ("shared") and the bytes callers asked for; not
+        // the name and size of the mapping object.
+        s.allocator_id = id_; s.name = detail::AllocatorBase::name_;
         s.live.live_count = live_count_; s.live.live_bytes = live_bytes_;
         s.live.peak_live_count = peak_live_; s.live.peak_live_bytes = peak_bytes_;
         s.live.reserved = total_bytes_; s.live.committed = total_bytes_;
-        s.accounting.total_requested_bytes = requested_bytes_;
+        s.accounting.total_requested_bytes = requested_;
         s.accounting.total_granted_bytes = granted_bytes_;
         s.fragmentation.internal_observable = false; s.fragmentation.external_observable = false;
         s.success_count = success_; s.failure_count = failures_;
@@ -179,10 +191,12 @@ public:
     }
 
     std::uint64_t published_offset() const {
+        if (!region_) return 0;   // not initialized, or shut down
         SharedHeader* h = reinterpret_cast<SharedHeader*>(region_);
         return h->published_offset;
     }
     std::uint64_t published_size() const {
+        if (!region_) return 0;
         SharedHeader* h = reinterpret_cast<SharedHeader*>(region_);
         return h->published_size;
     }
